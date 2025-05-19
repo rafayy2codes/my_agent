@@ -1,0 +1,15 @@
+python-dotenv
+fastapi
+uvicorn
+starlette
+pydantic
+langchain
+langchain-google-genai
+langchain-huggingface
+langgraph
+langgraph-prebuilt
+langchain-community
+wikipedia
+arxiv
+tavily-python
+
