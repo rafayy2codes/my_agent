@@ -1,17 +1,49 @@
 import os
+import time
 import traceback
+from collections import deque
 from dotenv import load_dotenv
 from langgraph.graph import START, StateGraph, MessagesState
 from langgraph.prebuilt import tools_condition
 from langgraph.prebuilt import ToolNode
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_community.document_loaders import WikipediaLoader, ArxivLoader
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 
 load_dotenv()
+
+# ---- General Rate limiting logic ----
+
+query_times = deque(maxlen=6)  # Stores timestamps for last 6 queries (global limit)
+
+def is_rate_limited() -> bool:
+    now = time.time()
+    # Remove timestamps older than 60 seconds
+    while query_times and now - query_times[0] > 60:
+        query_times.popleft()
+    return len(query_times) >= 6
+
+def record_query():
+    now = time.time()
+    query_times.append(now)
+
+def wait_for_next_minute():
+    now = time.time()
+    if len(query_times) < 6:
+        return
+    # Time until 60 seconds after the oldest timestamp
+    wait_time = 60 - (now - query_times[0])
+    if wait_time > 0:
+        print(f"[RateLimit] Waiting {wait_time:.2f} seconds to respect 6/min rate limit.")
+        time.sleep(wait_time)
+    # After waiting, clean up old timestamps
+    is_rate_limited()
+
+# ---- Tools ----
 
 @tool
 def multiply(a: int, b: int) -> int:
@@ -70,7 +102,6 @@ def web_search(query: str) -> str:
             ])
         return {"web_results": formatted_search_docs}
     except Exception as e:
-        import traceback
         tb = traceback.format_exc()
         print(f"[web_search] Error: {e}\n{tb}")
         return {"web_results": f"ERROR: Web search failed for '{query}'. Reason: {e}"}
@@ -87,13 +118,13 @@ def arxiv_search(query: str) -> str:
             ])
         return {"arxiv_results": formatted_search_docs}
     except Exception as e:
-        import traceback
         tb = traceback.format_exc()
         print(f"[arxiv_search] Error: {e}\n{tb}")
         return {"arxiv_results": f"ERROR: Arxiv search failed for '{query}'. Reason: {e}"}
 
-# Load the system prompt from file
-with open("app/agent/system_prompt.txt", "r", encoding="utf-8") as f:
+# ---- System prompt ----
+
+with open("system_prompt.txt", "r", encoding="utf-8") as f:
     system_prompt = f.read()
 
 sys_msg = SystemMessage(content=system_prompt)
@@ -109,9 +140,10 @@ tools = [
     arxiv_search,
 ]
 
-# Build graph function
+# ---- Build graph with general rate limiting ----
+
 def build_graph():
-    """Build the graph with Google Gemini only."""
+    """Build the graph with Google Gemini and general rate limiting."""
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GOOGLE_API_KEY in environment variables or .env file.")
@@ -122,11 +154,12 @@ def build_graph():
         google_api_key=api_key
     )
 
-
     llm_with_tools = llm.bind_tools(tools)
 
     def assistant(state: MessagesState):
-        """Assistant node"""
+        """Assistant node with general rate limiting."""
+        wait_for_next_minute()
+        record_query()
         return {"messages": [llm_with_tools.invoke(state["messages"])]}
 
     builder = StateGraph(MessagesState)
